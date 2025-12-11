@@ -1,3 +1,4 @@
+/* eslint-disable react-hooks/immutability */
 "use client";
 
 import dayjs, { Dayjs } from "dayjs";
@@ -18,23 +19,9 @@ type Block = {
 
 type ActualEvent = {
   id: string;
-  summary: string | null;
+  summary: string;
   start_time: string;
   end_time: string;
-};
-
-type WeeklySummary = {
-  focusScore: number;
-  xp: number;
-  summary: string;
-  perGoal: {
-    goalId: string;
-    title: string;
-    priority: string;
-    plannedHours: number;
-    actualHours: number;
-    matchPercent: number;
-  }[];
 };
 
 const START_HOUR = 0;
@@ -79,47 +66,18 @@ export default function TimelineClient({
     durationSlots: number;
   } | null>(null);
 
+  const totalSlots = (END_HOUR - START_HOUR) * (60 / SLOT_MINUTES);
   const [weekStart] = useState<Dayjs>(() =>
     dayjs().startOf("week").add(1, "day")
   );
 
-  const totalSlots = (END_HOUR - START_HOUR) * (60 / SLOT_MINUTES);
-
   const gridRef = useRef<HTMLDivElement | null>(null);
   const [gridWidth, setGridWidth] = useState<number | null>(null);
 
-  // Focus score state
-  const [weeklySummary, setWeeklySummary] =
-    useState<WeeklySummary | null>(null);
-  const [loadingSummary, setLoadingSummary] = useState(true);
-
-  // Load Focus Score from API
-  useEffect(() => {
-    async function loadSummary() {
-      try {
-        const res = await fetch("/api/focus/weekly", {
-          credentials: "include",
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setWeeklySummary(data);
-        } else {
-          console.error("Failed to load focus summary");
-        }
-      } catch (err) {
-        console.error("Error loading focus summary:", err);
-      } finally {
-        setLoadingSummary(false);
-      }
-    }
-    loadSummary();
-  }, []);
-
-  // Resize handler
+  // Resize listener
   useEffect(() => {
     function measure() {
-      if (gridRef.current)
-        setGridWidth(gridRef.current.clientWidth);
+      if (gridRef.current) setGridWidth(gridRef.current.clientWidth);
     }
     measure();
     window.addEventListener("resize", measure);
@@ -130,8 +88,25 @@ export default function TimelineClient({
   useEffect(() => {
     if (!drag) return;
 
+    function updateBlockFromGhost(b: Block, g: { col: number; startSlot: number; durationSlots: number }): Block {
+      const s = weekStart
+        .add(g.col, "day")
+        .hour(START_HOUR)
+        .minute(0)
+        .add(g.startSlot * SLOT_MINUTES, "minute");
+
+      const e = s.add(g.durationSlots * SLOT_MINUTES, "minute");
+
+      return {
+        ...b,
+        start_time: s.toISOString(),
+        end_time: e.toISOString(),
+      };
+    }
+
     function onMove(e: MouseEvent) {
       if (!gridRef.current || !gridWidth || !drag) return;
+
       const rect = gridRef.current.getBoundingClientRect();
       const gx = e.clientX - rect.left;
       const gy = e.clientY - rect.top;
@@ -141,7 +116,6 @@ export default function TimelineClient({
 
       const totalGridWidth = gridWidth - 60;
       const dayWidth = totalGridWidth / 7;
-
       const deltaDays = Math.round(dx / dayWidth);
       const deltaSlots = Math.round(dy / SLOT_HEIGHT);
 
@@ -185,19 +159,15 @@ export default function TimelineClient({
 
       const updated = blocks.map((b) =>
         b.id === drag.blockId
-          ? updateBlockFromGhost(b, ghost, weekStart)
+          ? updateBlockFromGhost(b, ghost)
           : b
       );
 
       setBlocks(updated);
-
-      const savedBlock = updated.find(
-        (b) => b.id === drag.blockId
-      );
-      if (savedBlock) saveBlockPosition(savedBlock);
-
-      setDrag(null);
       setGhost(null);
+      setDrag(null);
+
+      updated.forEach(saveBlockPosition);
     }
 
     window.addEventListener("mousemove", onMove);
@@ -206,7 +176,7 @@ export default function TimelineClient({
       window.removeEventListener("mousemove", onMove);
       window.removeEventListener("mouseup", onUp);
     };
-  }, [drag, ghost, gridWidth, blocks, weekStart, totalSlots]);
+  }, [drag, ghost, blocks, weekStart, gridWidth, totalSlots]);
 
   function saveBlockPosition(b: Block) {
     fetch("/api/blocks/update", {
@@ -221,60 +191,36 @@ export default function TimelineClient({
     }).catch(console.error);
   }
 
-  function updateBlockFromGhost(
-    b: Block,
-    g: { col: number; startSlot: number; durationSlots: number },
-    weekStart: Dayjs
-  ): Block {
-    const s = weekStart
-      .add(g.col, "day")
-      .hour(START_HOUR)
-      .minute(0)
-      .add(g.startSlot * SLOT_MINUTES, "minute");
-
-    const e = s.add(g.durationSlots * SLOT_MINUTES, "minute");
-
-    return {
-      ...b,
-      start_time: s.toISOString(),
-      end_time: e.toISOString(),
-    };
-  }
-
   function blockToGrid(b: Block) {
     const s = dayjs(b.start_time);
     const e = dayjs(b.end_time);
     let col = s.diff(weekStart, "day");
     if (col < 0) col = 0;
     if (col > 6) col = 6;
-
     const mins = (s.hour() - START_HOUR) * 60 + s.minute();
-    let startSlot = mins / SLOT_MINUTES;
-    let durSlots = e.diff(s, "minute") / SLOT_MINUTES;
-
-    if (durSlots < MIN_DURATION_SLOTS)
-      durSlots = MIN_DURATION_SLOTS;
-    if (startSlot < 0) startSlot = 0;
-    if (startSlot > totalSlots - MIN_DURATION_SLOTS)
-      startSlot = totalSlots - MIN_DURATION_SLOTS;
-    if (startSlot + durSlots > totalSlots) {
-      durSlots = totalSlots - startSlot;
-    }
-
-    return { col, startSlot, durationSlots: durSlots };
+    let start = mins / SLOT_MINUTES;
+    let dur = e.diff(s, "minute") / SLOT_MINUTES;
+    if (dur < MIN_DURATION_SLOTS) dur = MIN_DURATION_SLOTS;
+    if (start < 0) start = 0;
+    if (start > totalSlots - MIN_DURATION_SLOTS)
+      start = totalSlots - MIN_DURATION_SLOTS;
+    if (start + dur > totalSlots) dur = totalSlots - start;
+    return { col, startSlot: start, durationSlots: dur };
   }
 
   function eventToGrid(ev: ActualEvent) {
     const s = dayjs(ev.start_time);
     const startStr = ev.start_time;
     const isAllDay = startStr.length <= 10;
-    const e = isAllDay ? s.add(1, "day") : dayjs(ev.end_time);
+    const e = isAllDay
+      ? s.add(1, "day")
+      : dayjs(ev.end_time);
 
     let col = s.diff(weekStart, "day");
     if (col < 0) col = 0;
     if (col > 6) col = 6;
 
-    let sMin =
+    const sMin =
       (s.hour() - START_HOUR) * 60 + s.minute();
     let startSlot = isAllDay
       ? 0
@@ -287,6 +233,7 @@ export default function TimelineClient({
     if (startSlot < 0) startSlot = 0;
     if (startSlot > totalSlots - MIN_DURATION_SLOTS)
       startSlot = totalSlots - MIN_DURATION_SLOTS;
+
     if (startSlot + durationSlots > totalSlots)
       durationSlots = totalSlots - startSlot;
 
@@ -300,16 +247,12 @@ export default function TimelineClient({
   ) {
     e.preventDefault();
     if (!gridRef.current || !gridWidth) return;
-
     const rect = gridRef.current.getBoundingClientRect();
     const gx = e.clientX - rect.left;
     const gy = e.clientY - rect.top;
-
     const b = blocks.find((x) => x.id === id);
     if (!b) return;
-
     const pos = blockToGrid(b);
-
     setDrag({
       blockId: id,
       kind,
@@ -319,7 +262,6 @@ export default function TimelineClient({
       startSlot: pos.startSlot,
       durationSlots: pos.durationSlots,
     });
-
     setGhost({
       col: pos.col,
       startSlot: pos.startSlot,
@@ -348,119 +290,9 @@ export default function TimelineClient({
     });
   }
 
-  // --- UI helpers for score badge ---
-  function scoreColor(score: number) {
-    if (score >= 90) return "bg-emerald-600";
-    if (score >= 80) return "bg-green-600";
-    if (score >= 60) return "bg-yellow-500";
-    if (score > 0) return "bg-orange-500";
-    return "bg-gray-600";
-  }
-
-  function scoreLabel(score: number) {
-    if (score >= 90) return "Elite Focus";
-    if (score >= 80) return "Strong Week";
-    if (score >= 60) return "Decent Week";
-    if (score > 0) return "Scattered";
-    return "Not Scored Yet";
-  }
-
   return (
-    <div className="relative space-y-4">
-      {/* FOCUS SCORE CARD */}
-      <div className="w-full rounded-xl border border-gray-800 bg-gray-950/80 p-4 flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div
-            className={`w-16 h-16 rounded-full flex items-center justify-center text-white text-xl font-bold ${scoreColor(
-              weeklySummary?.focusScore ?? 0
-            )}`}
-          >
-            {loadingSummary
-              ? "…"
-              : weeklySummary
-              ? weeklySummary.focusScore
-              : "--"}
-          </div>
-          <div>
-            <div className="text-sm uppercase tracking-wide text-gray-400">
-              Weekly Focus Score
-            </div>
-            <div className="text-lg font-semibold text-gray-100">
-              {loadingSummary
-                ? "Calculating..."
-                : weeklySummary
-                ? scoreLabel(weeklySummary.focusScore)
-                : "Plan & sync to get scored"}
-            </div>
-            <p className="text-xs text-gray-400 mt-1 max-w-md">
-              {loadingSummary
-                ? "Comparing your planned blocks vs actual calendar time…"
-                : weeklySummary?.summary ??
-                  "Create planned blocks and sync your calendar to see your score."}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-col items-end gap-1">
-          <div className="text-xs text-gray-400">
-            Weekly XP Earned
-          </div>
-          <div className="text-lg font-semibold text-emerald-400">
-            {loadingSummary
-              ? "…"
-              : weeklySummary
-              ? `+${weeklySummary.xp} XP`
-              : "+0 XP"}
-          </div>
-          <div className="text-[11px] text-gray-500">
-            Stay above 80 to build a streak and earn bonus XP.
-          </div>
-        </div>
-      </div>
-
-      {/* PER-GOAL BREAKDOWN */}
-      {weeklySummary && weeklySummary.perGoal.length > 0 && (
-        <div className="w-full rounded-xl border border-gray-800 bg-gray-950/80 p-3">
-          <div className="text-xs font-semibold text-gray-300 mb-2">
-            Goal Breakdown
-          </div>
-          <div className="flex flex-col gap-2">
-            {weeklySummary.perGoal.map((g) => (
-              <div
-                key={g.goalId}
-                className="flex items-center justify-between text-xs"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-medium text-gray-100">
-                    {g.title}
-                  </span>
-                  <span className="px-1.5 py-0.5 rounded-full text-[10px] border border-gray-700 text-gray-300">
-                    {g.priority === "M"
-                      ? "Major"
-                      : g.priority === "m"
-                      ? "Minor"
-                      : "Optional"}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 text-[11px] text-gray-400">
-                  <span>
-                    Planned: {g.plannedHours.toFixed(1)}h
-                  </span>
-                  <span>
-                    Actual: {g.actualHours.toFixed(1)}h
-                  </span>
-                  <span className="font-semibold text-gray-200">
-                    Match: {g.matchPercent}%
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ADD SESSION BUTTONS */}
-      <div className="flex gap-2 mb-2 flex-wrap">
+    <div className="relative">
+      <div className="flex gap-2 mb-4 flex-wrap">
         {goals.map((g) => (
           <button
             key={g.id}
@@ -472,7 +304,6 @@ export default function TimelineClient({
         ))}
       </div>
 
-      {/* TIMELINE GRID */}
       <div
         ref={gridRef}
         className="relative border border-gray-800 bg-gray-950 rounded overflow-x-auto"
@@ -508,14 +339,10 @@ export default function TimelineClient({
         </div>
 
         <div className="absolute inset-0">
-          {/* ACTUAL EVENTS (red, behind) */}
+          {/* ACTUAL EVENTS (behind) */}
           {actualEvents.map((ev) => {
-            const {
-              col,
-              startSlot,
-              durationSlots,
-              isAllDay,
-            } = eventToGrid(ev);
+            const { col, startSlot, durationSlots, isAllDay } =
+              eventToGrid(ev);
 
             const left = `calc(60px + ${col} * (100% - 60px) / 7)`;
             const top = startSlot * SLOT_HEIGHT;
@@ -538,12 +365,11 @@ export default function TimelineClient({
                 }}
               >
                 {ev.summary ?? "Event"}
-                {isAllDay ? " (All Day)" : ""}
               </div>
             );
           })}
 
-          {/* PLANNED BLOCKS (blue) */}
+          {/* PLANNED BLOCKS */}
           {blocks.map((b) => {
             const pos = blockToGrid(b);
             const goal = goals.find((g) => g.id === b.goal_id);
@@ -589,7 +415,7 @@ export default function TimelineClient({
             );
           })}
 
-          {/* GHOST BLOCK (drag preview) */}
+          {/* GHOST BLOCK */}
           {drag && ghost && (() => {
             const { col, startSlot, durationSlots } = ghost;
             const left = `calc(60px + ${col} * (100% - 60px) / 7)`;
