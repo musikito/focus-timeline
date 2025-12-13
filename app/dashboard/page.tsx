@@ -3,6 +3,7 @@ import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
 import { createClient } from "@supabase/supabase-js";
 import GoalsDndClient from "./_goals-dnd-client";
+import DashboardClient from "@/components/dashboard-client";
 
 export const dynamic = "force-dynamic";
 
@@ -35,6 +36,8 @@ export default async function DashboardPage() {
     <div className="max-w-3xl mx-auto p-6 space-y-6">
       <h1 className="text-3xl font-bold">Weekly Goals</h1>
       <GoalsDndClient initialGoals={goals || []} />
+      
+      <DashboardClient />
     </div>
   );
 }

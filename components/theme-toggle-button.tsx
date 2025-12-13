@@ -1,28 +1,31 @@
+/* eslint-disable react-hooks/set-state-in-effect */
 "use client";
 
-import { useTheme } from "@/components/theme-provider";
+import { useTheme } from "next-themes";
 import { useEffect, useState } from "react";
 
-export default function ThemeToggleButton() {
-  const { theme, toggleTheme } = useTheme();
-  const isClient = typeof window !== "undefined";
+export function ThemeToggleButton() {
+  const { theme, setTheme } = useTheme();
+  const [mounted, setMounted] = useState(false);
 
-  if (!isClient) {
-    // Render placeholder button shape but no dynamic text yet
+  useEffect(() => setMounted(true), []);
+
+  if (!mounted) {
     return (
-      <button
-        className="text-xs py-2 px-3 rounded bg-gray-700 text-gray-100 dark:bg-gray-300 dark:text-gray-900 w-full opacity-0"
-        aria-hidden="true"
-      />
+      <button className="px-3 py-2 text-xs rounded bg-gray-200 dark:bg-gray-700">
+        …
+      </button>
     );
   }
 
+  const isDark = theme === "dark";
+
   return (
     <button
-      onClick={toggleTheme}
-      className="text-xs py-2 px-3 rounded bg-gray-700 text-gray-100 dark:bg-gray-300 dark:text-gray-900 w-full"
+      onClick={() => setTheme(isDark ? "light" : "dark")}
+      className="px-3 py-2 text-xs rounded bg-gray-200 dark:bg-gray-700"
     >
-      Switch to {theme === "light" ? "Dark" : "Light"} Mode
+      {isDark ? "Light" : "Dark"}
     </button>
   );
 }

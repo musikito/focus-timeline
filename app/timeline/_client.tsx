@@ -1,627 +1,405 @@
 "use client";
 
-import dayjs, { Dayjs } from "dayjs";
-import { useEffect, useRef, useState } from "react";
+import React, { useEffect, useMemo, useRef, useState } from "react";
 
-type Goal = {
+type Priority = "M" | "m" | "O";
+
+export type Goal = {
   id: string;
   title: string;
-  goal_type: string;
+  priority: Priority;
 };
 
-type Block = {
+export type PlannedBlock = {
   id: string;
   goal_id: string;
-  start_time: string;
-  end_time: string;
+  start_time: string; // ISO
+  end_time: string; // ISO
 };
 
-type ActualEvent = {
+export type CalendarEvent = {
   id: string;
-  summary: string | null;
-  start_time: string;
-  end_time: string;
+  summary?: string | null;
+  start_time: string; // ISO
+  end_time: string; // ISO
 };
 
-type WeeklySummary = {
-  focusScore: number;
-  xp: number;
-  summary: string;
-  perGoal: {
-    goalId: string;
-    title: string;
-    priority: string;
-    plannedHours: number;
-    actualHours: number;
-    matchPercent: number;
-  }[];
+type Props = {
+  goals: Goal[];
+  plannedBlocks: PlannedBlock[];
+  calendarEvents?: CalendarEvent[];
+  /**
+   * Optional callback if you want to persist moves server-side.
+   * If not provided, blocks will move only in local UI state.
+   */
+  onMoveBlock?: (blockId: string, nextStartISO: string, nextEndISO: string) => Promise<void> | void;
 };
 
-const START_HOUR = 0;
-const END_HOUR = 24;
-const SLOT_MINUTES = 30;
-const SLOT_HEIGHT = 24;
-const MIN_DURATION_SLOTS = 2;
-const days = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
-
-const hours = Array.from({ length: END_HOUR - START_HOUR }).map(
-  (_, i) => START_HOUR + i
-);
-
-type DragKind = "move" | "resize-top" | "resize-bottom";
-
-type DragState =
-  | null
-  | {
-      blockId: string;
-      kind: DragKind;
-      startGridX: number;
-      startGridY: number;
-      startCol: number;
-      startSlot: number;
-      durationSlots: number;
-    };
-
+/**
+ * Weekly Timeline Grid
+ * - Columns = days (Mon..Sun)
+ * - Rows = 30-min slots from START_HOUR..END_HOUR
+ * - Planned blocks are draggable and snap to the grid.
+ */
 export default function TimelineClient({
   goals,
   plannedBlocks,
-  actualEvents,
-}: {
-  goals: Goal[];
-  plannedBlocks: Block[];
-  actualEvents: ActualEvent[];
-}) {
-  const [blocks, setBlocks] = useState(plannedBlocks);
-  const [drag, setDrag] = useState<DragState>(null);
-  const [ghost, setGhost] = useState<{
-    col: number;
-    startSlot: number;
-    durationSlots: number;
-  } | null>(null);
+  calendarEvents = [],
+  onMoveBlock,
+}: Props) {
+  // ---- Grid settings (tweak safely) ----
+  const DAYS = ["Mon", "Tue", "Wed", "Thu", "Fri", "Sat", "Sun"];
+  const START_HOUR = 6;
+  const END_HOUR = 22; // exclusive
+  const SLOT_MIN = 30;
 
-  const [weekStart] = useState<Dayjs>(() =>
-    dayjs().startOf("week").add(1, "day")
-  );
+  const ROW_H = 22; // px per 30-min slot
+  const COL_W = 170; // px per day column
+  const HEADER_H = 44; // px
 
-  const totalSlots = (END_HOUR - START_HOUR) * (60 / SLOT_MINUTES);
+  const SLOTS_PER_DAY = ((END_HOUR - START_HOUR) * 60) / SLOT_MIN;
 
   const gridRef = useRef<HTMLDivElement | null>(null);
-  const [gridWidth, setGridWidth] = useState<number | null>(null);
 
-  // Focus score state
-  const [weeklySummary, setWeeklySummary] =
-    useState<WeeklySummary | null>(null);
-  const [loadingSummary, setLoadingSummary] = useState(true);
+  // ---- Build goal lookup ----
+  const goalById = useMemo(() => {
+    const m = new Map<string, Goal>();
+    for (const g of goals) m.set(g.id, g);
+    return m;
+  }, [goals]);
 
-  // Load Focus Score from API
+  // ---- Keep local editable state for planned blocks ----
+  const [blocks, setBlocks] = useState<PlannedBlock[]>(plannedBlocks);
+
   useEffect(() => {
-    async function loadSummary() {
-      try {
-        const res = await fetch("/api/focus/weekly", {
-          credentials: "include",
-        });
-        if (res.ok) {
-          const data = await res.json();
-          setWeeklySummary(data);
-        } else {
-          console.error("Failed to load focus summary");
-        }
-      } catch (err) {
-        console.error("Error loading focus summary:", err);
-      } finally {
-        setLoadingSummary(false);
-      }
-    }
-    loadSummary();
-  }, []);
+    setBlocks(plannedBlocks);
+  }, [plannedBlocks]);
 
-  // Resize handler
-  useEffect(() => {
-    function measure() {
-      if (gridRef.current)
-        setGridWidth(gridRef.current.clientWidth);
-    }
-    measure();
-    window.addEventListener("resize", measure);
-    return () => window.removeEventListener("resize", measure);
-  }, []);
+  // ---- Drag state ----
+  const [draggingId, setDraggingId] = useState<string | null>(null);
+  const dragOffset = useRef<{ dx: number; dy: number } | null>(null);
+  const dragStartSnapshot = useRef<PlannedBlock | null>(null);
 
-  // Drag handling
-  useEffect(() => {
-    if (!drag) return;
+  // Convert ISO time to (dayIndex, slotIndex, durationSlots)
+  const blockToGrid = (b: PlannedBlock) => {
+    const start = new Date(b.start_time);
+    const end = new Date(b.end_time);
 
-    function onMove(e: MouseEvent) {
-      if (!gridRef.current || !gridWidth || !drag) return;
-      const rect = gridRef.current.getBoundingClientRect();
-      const gx = e.clientX - rect.left;
-      const gy = e.clientY - rect.top;
+    // We treat the week based on the start_time’s local weekday.
+    // JS: 0=Sun..6=Sat. We want Mon=0..Sun=6
+    const jsDay = start.getDay(); // 0..6
+    const dayIndex = (jsDay + 6) % 7; // Mon=0 ... Sun=6
 
-      const dx = gx - drag.startGridX;
-      const dy = gy - drag.startGridY;
+    const startMins = start.getHours() * 60 + start.getMinutes();
+    const endMins = end.getHours() * 60 + end.getMinutes();
 
-      const totalGridWidth = gridWidth - 60;
-      const dayWidth = totalGridWidth / 7;
+    const startClamped = Math.max(START_HOUR * 60, Math.min(endMins, startMins));
+    const endClamped = Math.max(startClamped + SLOT_MIN, Math.min(END_HOUR * 60, endMins));
 
-      const deltaDays = Math.round(dx / dayWidth);
-      const deltaSlots = Math.round(dy / SLOT_HEIGHT);
-
-      let col = drag.startCol;
-      let startSlot = drag.startSlot;
-      let durationSlots = drag.durationSlots;
-
-      if (drag.kind === "move") {
-        col += deltaDays;
-        startSlot += deltaSlots;
-      } else if (drag.kind === "resize-top") {
-        startSlot += deltaSlots;
-        const maxStart =
-          drag.startSlot + drag.durationSlots - MIN_DURATION_SLOTS;
-        if (startSlot > maxStart) startSlot = maxStart;
-      } else if (drag.kind === "resize-bottom") {
-        durationSlots += deltaSlots;
-        if (durationSlots < MIN_DURATION_SLOTS)
-          durationSlots = MIN_DURATION_SLOTS;
-      }
-
-      if (col < 0) col = 0;
-      if (col > 6) col = 6;
-
-      if (startSlot < 0) startSlot = 0;
-      if (startSlot > totalSlots - MIN_DURATION_SLOTS)
-        startSlot = totalSlots - MIN_DURATION_SLOTS;
-
-      if (startSlot + durationSlots > totalSlots)
-        durationSlots = totalSlots - startSlot;
-
-      setGhost({ col, startSlot, durationSlots });
-    }
-
-    function onUp() {
-      if (!drag || !ghost) {
-        setGhost(null);
-        setDrag(null);
-        return;
-      }
-
-      const updated = blocks.map((b) =>
-        b.id === drag.blockId
-          ? updateBlockFromGhost(b, ghost, weekStart)
-          : b
-      );
-
-      setBlocks(updated);
-
-      const savedBlock = updated.find(
-        (b) => b.id === drag.blockId
-      );
-      if (savedBlock) saveBlockPosition(savedBlock);
-
-      setDrag(null);
-      setGhost(null);
-    }
-
-    window.addEventListener("mousemove", onMove);
-    window.addEventListener("mouseup", onUp);
-    return () => {
-      window.removeEventListener("mousemove", onMove);
-      window.removeEventListener("mouseup", onUp);
-    };
-  }, [drag, ghost, gridWidth, blocks, weekStart, totalSlots]);
-
-  function saveBlockPosition(b: Block) {
-    fetch("/api/blocks/update", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({
-        id: b.id,
-        start_time: b.start_time,
-        end_time: b.end_time,
-      }),
-    }).catch(console.error);
-  }
-
-  function updateBlockFromGhost(
-    b: Block,
-    g: { col: number; startSlot: number; durationSlots: number },
-    weekStart: Dayjs
-  ): Block {
-    const s = weekStart
-      .add(g.col, "day")
-      .hour(START_HOUR)
-      .minute(0)
-      .add(g.startSlot * SLOT_MINUTES, "minute");
-
-    const e = s.add(g.durationSlots * SLOT_MINUTES, "minute");
+    const slotIndex = Math.round((startClamped - START_HOUR * 60) / SLOT_MIN);
+    const durationSlots = Math.max(
+      1,
+      Math.round((endClamped - startClamped) / SLOT_MIN)
+    );
 
     return {
-      ...b,
-      start_time: s.toISOString(),
-      end_time: e.toISOString(),
+      dayIndex: clamp(dayIndex, 0, 6),
+      slotIndex: clamp(slotIndex, 0, SLOTS_PER_DAY - 1),
+      durationSlots: clamp(durationSlots, 1, SLOTS_PER_DAY),
     };
-  }
+  };
 
-  function blockToGrid(b: Block) {
-    const s = dayjs(b.start_time);
-    const e = dayjs(b.end_time);
-    let col = s.diff(weekStart, "day");
-    if (col < 0) col = 0;
-    if (col > 6) col = 6;
+  // Convert (dayIndex, slotIndex, durationSlots) back to ISO
+  const gridToISO = (b: PlannedBlock, dayIndex: number, slotIndex: number) => {
+    const origStart = new Date(b.start_time);
+    const origEnd = new Date(b.end_time);
+    const durationMinutes = Math.max(30, (origEnd.getTime() - origStart.getTime()) / 60000);
 
-    const mins = (s.hour() - START_HOUR) * 60 + s.minute();
-    let startSlot = mins / SLOT_MINUTES;
-    let durSlots = e.diff(s, "minute") / SLOT_MINUTES;
+    // Compute Monday of the block’s week (local)
+    const d = new Date(origStart);
+    const jsDay = d.getDay(); // 0..6
+    const mondayOffset = (jsDay + 6) % 7; // days since Monday
+    const monday = new Date(d);
+    monday.setDate(d.getDate() - mondayOffset);
+    monday.setHours(0, 0, 0, 0);
 
-    if (durSlots < MIN_DURATION_SLOTS)
-      durSlots = MIN_DURATION_SLOTS;
-    if (startSlot < 0) startSlot = 0;
-    if (startSlot > totalSlots - MIN_DURATION_SLOTS)
-      startSlot = totalSlots - MIN_DURATION_SLOTS;
-    if (startSlot + durSlots > totalSlots) {
-      durSlots = totalSlots - startSlot;
-    }
+    // Target day
+    const nextStart = new Date(monday);
+    nextStart.setDate(monday.getDate() + dayIndex);
 
-    return { col, startSlot, durationSlots: durSlots };
-  }
+    const minutesFromStart = START_HOUR * 60 + slotIndex * SLOT_MIN;
+    nextStart.setHours(Math.floor(minutesFromStart / 60), minutesFromStart % 60, 0, 0);
 
-  function eventToGrid(ev: ActualEvent) {
-    const s = dayjs(ev.start_time);
-    const startStr = ev.start_time;
-    const isAllDay = startStr.length <= 10;
-    const e = isAllDay ? s.add(1, "day") : dayjs(ev.end_time);
+    const nextEnd = new Date(nextStart.getTime() + durationMinutes * 60000);
 
-    let col = s.diff(weekStart, "day");
-    if (col < 0) col = 0;
-    if (col > 6) col = 6;
+    return {
+      nextStartISO: nextStart.toISOString(),
+      nextEndISO: nextEnd.toISOString(),
+    };
+  };
 
-    let sMin =
-      (s.hour() - START_HOUR) * 60 + s.minute();
-    let startSlot = isAllDay
-      ? 0
-      : Math.floor(sMin / SLOT_MINUTES);
+  const startDrag = (e: React.PointerEvent, blockId: string) => {
+    const el = e.currentTarget as HTMLDivElement;
+    el.setPointerCapture(e.pointerId);
 
-    let durationSlots = isAllDay
-      ? totalSlots
-      : Math.ceil(e.diff(s, "minute") / SLOT_MINUTES);
+    const gridEl = gridRef.current;
+    if (!gridEl) return;
 
-    if (startSlot < 0) startSlot = 0;
-    if (startSlot > totalSlots - MIN_DURATION_SLOTS)
-      startSlot = totalSlots - MIN_DURATION_SLOTS;
-    if (startSlot + durationSlots > totalSlots)
-      durationSlots = totalSlots - startSlot;
+    const rect = gridEl.getBoundingClientRect();
+    const x = e.clientX - rect.left;
+    const y = e.clientY - rect.top;
 
-    return { col, startSlot, durationSlots, isAllDay };
-  }
-
-  function startDrag(
-    e: React.MouseEvent,
-    id: string,
-    kind: DragKind
-  ) {
-    e.preventDefault();
-    if (!gridRef.current || !gridWidth) return;
-
-    const rect = gridRef.current.getBoundingClientRect();
-    const gx = e.clientX - rect.left;
-    const gy = e.clientY - rect.top;
-
-    const b = blocks.find((x) => x.id === id);
+    // Find block in state
+    const b = blocks.find((bb) => bb.id === blockId);
     if (!b) return;
 
-    const pos = blockToGrid(b);
+    const g = blockToGrid(b);
 
-    setDrag({
-      blockId: id,
-      kind,
-      startGridX: gx,
-      startGridY: gy,
-      startCol: pos.col,
-      startSlot: pos.startSlot,
-      durationSlots: pos.durationSlots,
-    });
+    // Current block top-left in grid coords
+    const blockLeft = g.dayIndex * COL_W;
+    const blockTop = HEADER_H + g.slotIndex * ROW_H;
 
-    setGhost({
-      col: pos.col,
-      startSlot: pos.startSlot,
-      durationSlots: pos.durationSlots,
-    });
-  }
+    dragOffset.current = { dx: x - blockLeft, dy: y - blockTop };
+    dragStartSnapshot.current = b;
 
-  function addBlock(goalId: string) {
-    const s = dayjs().hour(9).minute(0);
-    const e = s.add(1, "hour");
+    setDraggingId(blockId);
+  };
 
-    const b: Block = {
-      id: crypto.randomUUID(),
-      goal_id: goalId,
-      start_time: s.toISOString(),
-      end_time: e.toISOString(),
+  // Keep dragging movement global (smooth even if pointer leaves block)
+  useEffect(() => {
+    if (!draggingId) return;
+
+    const gridEl = gridRef.current;
+    if (!gridEl) return;
+
+    const handleMove = (ev: PointerEvent) => {
+      const rect = gridEl.getBoundingClientRect();
+      const x = ev.clientX - rect.left;
+      const y = ev.clientY - rect.top;
+
+      const off = dragOffset.current;
+      const snap = dragStartSnapshot.current;
+      if (!off || !snap) return;
+
+      // Snap to grid: determine intended top-left
+      const rawLeft = x - off.dx;
+      const rawTop = y - off.dy;
+
+      // Convert to day/slot
+      const dayIndex = clamp(Math.round(rawLeft / COL_W), 0, 6);
+
+      // Important: clamp inside the slot region (below header)
+      const topInside = clamp(rawTop, HEADER_H, HEADER_H + (SLOTS_PER_DAY - 1) * ROW_H);
+      const slotIndex = clamp(
+        Math.round((topInside - HEADER_H) / ROW_H),
+        0,
+        SLOTS_PER_DAY - 1
+      );
+
+      const { nextStartISO, nextEndISO } = gridToISO(snap, dayIndex, slotIndex);
+
+      setBlocks((prev) =>
+        prev.map((b) =>
+          b.id === draggingId ? { ...b, start_time: nextStartISO, end_time: nextEndISO } : b
+        )
+      );
     };
 
-    setBlocks((prev) => [...prev, b]);
+    const handleUp = async () => {
+      const moved = blocks.find((b) => b.id === draggingId);
+      const original = dragStartSnapshot.current;
 
-    fetch("/api/blocks/create", {
-      method: "POST",
-      credentials: "include",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify(b),
-    });
-  }
+      setDraggingId(null);
+      dragOffset.current = null;
+      dragStartSnapshot.current = null;
 
-  // --- UI helpers for score badge ---
-  function scoreColor(score: number) {
-    if (score >= 90) return "bg-emerald-600";
-    if (score >= 80) return "bg-green-600";
-    if (score >= 60) return "bg-yellow-500";
-    if (score > 0) return "bg-orange-500";
-    return "bg-gray-600";
-  }
+      // Persist if callback exists and something changed
+      if (onMoveBlock && moved && original) {
+        if (moved.start_time !== original.start_time || moved.end_time !== original.end_time) {
+          try {
+            await onMoveBlock(moved.id, moved.start_time, moved.end_time);
+          } catch (err) {
+            console.error("Failed to persist move", err);
+            // Optional: revert on error
+            setBlocks((prev) =>
+              prev.map((b) => (b.id === original.id ? original : b))
+            );
+          }
+        }
+      }
+    };
 
-  function scoreLabel(score: number) {
-    if (score >= 90) return "Elite Focus";
-    if (score >= 80) return "Strong Week";
-    if (score >= 60) return "Decent Week";
-    if (score > 0) return "Scattered";
-    return "Not Scored Yet";
-  }
+    window.addEventListener("pointermove", handleMove);
+    window.addEventListener("pointerup", handleUp);
+
+    return () => {
+      window.removeEventListener("pointermove", handleMove);
+      window.removeEventListener("pointerup", handleUp);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draggingId, onMoveBlock, blocks]);
+
+  // ----- Render helpers -----
+  const formatTime = (iso: string) => {
+    const d = new Date(iso);
+    const hh = d.getHours();
+    const mm = d.getMinutes().toString().padStart(2, "0");
+    const ampm = hh >= 12 ? "PM" : "AM";
+    const hr = hh % 12 === 0 ? 12 : hh % 12;
+    return `${hr}:${mm} ${ampm}`;
+  };
+
+  const priorityBadge = (p: Priority) => {
+    if (p === "M") return "Major";
+    if (p === "O") return "Optional";
+    return "Minor";
+  };
 
   return (
-    <div className="relative space-y-4">
-      {/* FOCUS SCORE CARD */}
-      <div className="w-full rounded-xl border border-gray-800 bg-gray-950/80 p-4 flex flex-col md:flex-row gap-4 items-start md:items-center justify-between">
-        <div className="flex items-center gap-4">
-          <div
-            className={`w-16 h-16 rounded-full flex items-center justify-center text-white text-xl font-bold ${scoreColor(
-              weeklySummary?.focusScore ?? 0
-            )}`}
-          >
-            {loadingSummary
-              ? "…"
-              : weeklySummary
-              ? weeklySummary.focusScore
-              : "--"}
-          </div>
-          <div>
-            <div className="text-sm uppercase tracking-wide text-gray-400">
-              Weekly Focus Score
-            </div>
-            <div className="text-lg font-semibold text-gray-100">
-              {loadingSummary
-                ? "Calculating..."
-                : weeklySummary
-                ? scoreLabel(weeklySummary.focusScore)
-                : "Plan & sync to get scored"}
-            </div>
-            <p className="text-xs text-gray-400 mt-1 max-w-md">
-              {loadingSummary
-                ? "Comparing your planned blocks vs actual calendar time…"
-                : weeklySummary?.summary ??
-                  "Create planned blocks and sync your calendar to see your score."}
-            </p>
-          </div>
-        </div>
-
-        <div className="flex flex-col items-end gap-1">
-          <div className="text-xs text-gray-400">
-            Weekly XP Earned
-          </div>
-          <div className="text-lg font-semibold text-emerald-400">
-            {loadingSummary
-              ? "…"
-              : weeklySummary
-              ? `+${weeklySummary.xp} XP`
-              : "+0 XP"}
-          </div>
-          <div className="text-[11px] text-gray-500">
-            Stay above 80 to build a streak and earn bonus XP.
-          </div>
+    <div className="space-y-4">
+      <div className="flex items-end justify-between gap-3">
+        <div>
+          <h1 className="text-2xl font-bold">Timeline</h1>
+          <p className="text-sm text-[var(--text-muted)]">
+            Drag blocks to reschedule. Blocks snap to 30-minute grid.
+          </p>
         </div>
       </div>
 
-      {/* PER-GOAL BREAKDOWN */}
-      {weeklySummary && weeklySummary.perGoal.length > 0 && (
-        <div className="w-full rounded-xl border border-gray-800 bg-gray-950/80 p-3">
-          <div className="text-xs font-semibold text-gray-300 mb-2">
-            Goal Breakdown
-          </div>
-          <div className="flex flex-col gap-2">
-            {weeklySummary.perGoal.map((g) => (
-              <div
-                key={g.goalId}
-                className="flex items-center justify-between text-xs"
-              >
-                <div className="flex items-center gap-2">
-                  <span className="font-medium text-gray-100">
-                    {g.title}
-                  </span>
-                  <span className="px-1.5 py-0.5 rounded-full text-[10px] border border-gray-700 text-gray-300">
-                    {g.priority === "M"
-                      ? "Major"
-                      : g.priority === "m"
-                      ? "Minor"
-                      : "Optional"}
-                  </span>
-                </div>
-                <div className="flex items-center gap-3 text-[11px] text-gray-400">
-                  <span>
-                    Planned: {g.plannedHours.toFixed(1)}h
-                  </span>
-                  <span>
-                    Actual: {g.actualHours.toFixed(1)}h
-                  </span>
-                  <span className="font-semibold text-gray-200">
-                    Match: {g.matchPercent}%
-                  </span>
-                </div>
-              </div>
-            ))}
-          </div>
-        </div>
-      )}
-
-      {/* ADD SESSION BUTTONS */}
-      <div className="flex gap-2 mb-2 flex-wrap">
-        {goals.map((g) => (
-          <button
-            key={g.id}
-            onClick={() => addBlock(g.id)}
-            className="bg-green-600 text-white text-xs px-3 py-1 rounded"
-          >
-            + {g.title}
-          </button>
-        ))}
-      </div>
-
-      {/* TIMELINE GRID */}
       <div
         ref={gridRef}
-        className="relative border border-gray-800 bg-gray-950 rounded overflow-x-auto"
-        style={{ minHeight: 600 }}
+        className="relative overflow-auto rounded-2xl border border-[var(--border)] bg-[var(--bg-alt)]"
+        style={{
+          // Ensure the grid has real height so blocks can be dragged
+          height: HEADER_H + SLOTS_PER_DAY * ROW_H + 24,
+        }}
       >
+        {/* Header row */}
         <div
-          className="grid text-gray-200"
-          style={{ gridTemplateColumns: "60px repeat(7,1fr)" }}
+          className="sticky top-0 z-20 flex border-b border-[var(--border)] bg-[var(--bg-alt)]"
+          style={{ height: HEADER_H }}
         >
-          <div></div>
-          {days.map((d) => (
+          {DAYS.map((d) => (
             <div
               key={d}
-              className="border-b border-gray-900 h-10 flex items-center justify-center font-semibold"
+              className="flex items-center justify-center text-sm font-semibold text-[var(--text)]"
+              style={{ width: COL_W }}
             >
               {d}
             </div>
           ))}
-
-          {hours.map((hr) => (
-            <div key={`hr-${hr}`} className="contents">
-              <div className="text-xs text-gray-500 text-right pr-2 border-r border-gray-800">
-                {dayjs().hour(hr).format("h A")}
-              </div>
-              {Array.from({ length: 7 }).map((_, i) => (
-                <div
-                  key={`cell-${hr}-${i}`}
-                  className="border border-gray-900 h-[48px]"
-                />
-              ))}
-            </div>
-          ))}
         </div>
 
-        <div className="absolute inset-0">
-          {/* ACTUAL EVENTS (red, behind) */}
-          {actualEvents.map((ev) => {
-            const {
-              col,
-              startSlot,
-              durationSlots,
-              isAllDay,
-            } = eventToGrid(ev);
+        {/* Grid body */}
+        <div
+          className="relative"
+          style={{
+            width: DAYS.length * COL_W,
+            height: SLOTS_PER_DAY * ROW_H + 24,
+          }}
+        >
+          {/* Background grid lines */}
+          {Array.from({ length: DAYS.length }).map((_, day) => (
+            <div
+              key={day}
+              className="absolute top-0 bottom-0 border-r border-[var(--border)]"
+              style={{ left: day * COL_W, width: 1 }}
+            />
+          ))}
 
-            const left = `calc(60px + ${col} * (100% - 60px) / 7)`;
-            const top = startSlot * SLOT_HEIGHT;
-            const height = durationSlots * SLOT_HEIGHT;
+          {Array.from({ length: SLOTS_PER_DAY + 1 }).map((_, i) => (
+            <div
+              key={i}
+              className="absolute left-0 right-0 border-t border-[var(--border)] opacity-60"
+              style={{ top: i * ROW_H + 0 }}
+            />
+          ))}
 
+          {/* Calendar events (non-draggable, faint red) */}
+          {calendarEvents.map((ev) => {
+            const fake: PlannedBlock = {
+              id: ev.id,
+              goal_id: "calendar",
+              start_time: ev.start_time,
+              end_time: ev.end_time,
+            };
+            const g = blockToGrid(fake);
             return (
               <div
-                key={ev.id}
-                className={`absolute ${
-                  isAllDay
-                    ? "bg-red-700/40 border border-red-500/40"
-                    : "bg-red-600/60"
-                } text-white text-[10px] px-1 py-1 pointer-events-none rounded`}
+                key={`cal-${ev.id}`}
+                className="absolute z-5 rounded-lg border border-red-400/30 bg-red-500/10 text-red-200"
                 style={{
-                  left,
-                  top,
-                  width: `calc((100% - 60px) / 7 - 6px)`,
-                  height,
-                  zIndex: 0,
+                  left: g.dayIndex * COL_W + 6,
+                  top: HEADER_H + g.slotIndex * ROW_H + 2,
+                  width: COL_W - 12,
+                  height: g.durationSlots * ROW_H - 4,
+                  pointerEvents: "none",
                 }}
+                title={ev.summary ?? "Calendar event"}
               >
-                {ev.summary ?? "Event"}
-                {isAllDay ? " (All Day)" : ""}
+                <div className="px-2 py-1 text-[11px] font-medium truncate">
+                  {ev.summary ?? "Calendar"}
+                </div>
               </div>
             );
           })}
 
-          {/* PLANNED BLOCKS (blue) */}
+          {/* Planned blocks (draggable, blue) */}
           {blocks.map((b) => {
-            const pos = blockToGrid(b);
-            const goal = goals.find((g) => g.id === b.goal_id);
-            const isDragging =
-              drag && drag.blockId === b.id && ghost;
+            const goal = goalById.get(b.goal_id);
+            const g = blockToGrid(b);
 
-            const left = `calc(60px + ${pos.col} * (100% - 60px) / 7)`;
-            const top = pos.startSlot * SLOT_HEIGHT;
-            const height = pos.durationSlots * SLOT_HEIGHT;
+            const title = goal?.title ?? "Untitled";
+            const p = goal?.priority ?? "m";
+
+            const isDragging = draggingId === b.id;
 
             return (
               <div
                 key={b.id}
-                className="absolute bg-blue-600 text-white text-[10px] rounded shadow"
+                onPointerDown={(e) => startDrag(e, b.id)}
+                className={[
+                  "absolute z-10 rounded-xl border shadow-sm",
+                  "bg-blue-600 text-white border-blue-300/30",
+                  "select-none touch-none",
+                  "cursor-grab active:cursor-grabbing",
+                  isDragging ? "opacity-90 ring-2 ring-blue-300" : "opacity-100",
+                ].join(" ")}
                 style={{
-                  left,
-                  top,
-                  width: `calc((100% - 60px) / 7 - 6px)`,
-                  height,
-                  opacity: isDragging ? 0.35 : 1,
-                  zIndex: 1,
+                  left: g.dayIndex * COL_W + 6,
+                  top: HEADER_H + g.slotIndex * ROW_H + 2,
+                  width: COL_W - 12,
+                  height: g.durationSlots * ROW_H - 4,
                 }}
+                title={`${title} • ${formatTime(b.start_time)} – ${formatTime(b.end_time)}`}
               >
-                <div
-                  className="h-1 w-full cursor-n-resize"
-                  onMouseDown={(e) =>
-                    startDrag(e, b.id, "resize-top")
-                  }
-                />
-                <div
-                  className="flex-1 px-1 py-1 cursor-move"
-                  onMouseDown={(e) => startDrag(e, b.id, "move")}
-                >
-                  {goal?.title}
+                {/* Label */}
+                <div className="flex items-center justify-between gap-2 px-2 pt-2">
+                  <div className="min-w-0">
+                    <div className="text-xs font-semibold truncate">{title}</div>
+                    <div className="text-[10px] opacity-90">
+                      {formatTime(b.start_time)} – {formatTime(b.end_time)}
+                    </div>
+                  </div>
+                  <div className="shrink-0 text-[10px] px-2 py-0.5 rounded-full bg-white/15 border border-white/20">
+                    {priorityBadge(p as Priority)}
+                  </div>
                 </div>
-                <div
-                  className="h-1 w-full cursor-s-resize"
-                  onMouseDown={(e) =>
-                    startDrag(e, b.id, "resize-bottom")
-                  }
-                />
               </div>
             );
           })}
-
-          {/* GHOST BLOCK (drag preview) */}
-          {drag && ghost && (() => {
-            const { col, startSlot, durationSlots } = ghost;
-            const left = `calc(60px + ${col} * (100% - 60px) / 7)`;
-            const top = startSlot * SLOT_HEIGHT;
-            const height = durationSlots * SLOT_HEIGHT;
-
-            const block = blocks.find(
-              (b) => b.id === drag.blockId
-            );
-            const goal = block
-              ? goals.find((g) => g.id === block.goal_id)
-              : null;
-
-            return (
-              <div
-                className="absolute bg-blue-400/70 text-white text-[10px] rounded shadow pointer-events-none"
-                style={{
-                  left,
-                  top,
-                  width: `calc((100% - 60px) / 7 - 6px)`,
-                  height,
-                  zIndex: 2,
-                }}
-              >
-                <div className="p-1 truncate">
-                  {goal?.title ?? "Goal"}
-                </div>
-              </div>
-            );
-          })()}
         </div>
+      </div>
+
+      <div className="text-xs text-[var(--text-muted)]">
+        Tip: If blocks don’t move, it’s usually an overlay blocking pointer events. This file avoids that by keeping drag handlers on the block itself and using window-level pointermove.
       </div>
     </div>
   );
+}
+
+/* ------------------ Utils ------------------ */
+
+function clamp(n: number, min: number, max: number) {
+  return Math.max(min, Math.min(max, n));
 }
