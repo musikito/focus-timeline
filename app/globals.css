@@ -1,4 +1,21 @@
 @import "tailwindcss";
+
+@keyframes slide-in-from-top {
+  from {
+    transform: translateY(-10px);
+    opacity: 0;
+  }
+  to {
+    transform: translateY(0);
+    opacity: 1;
+  }
+}
+
+.animate-in {
+  animation: slide-in-from-top 0.18s ease-out;
+}
+
+
 @layer base {
   :root {
     --bg: #f8fafc; /* light background */

@@ -1,46 +1,71 @@
 // app/dashboard/page.tsx
 import { auth } from "@clerk/nextjs/server";
 import { redirect } from "next/navigation";
-import { createClient } from "@supabase/supabase-js";
-import GoalsDndClient from "./_goals-dnd-client";
-import DashboardClient from "@/components/dashboard-client";
-
-export const dynamic = "force-dynamic";
+import { supabase } from "@/lib/supabase";
+import DashboardClient from "./page.client";
 
 export default async function DashboardPage() {
   const { userId } = await auth();
   if (!userId) redirect("/sign-in");
 
-  const supabase = createClient(
-    process.env.NEXT_PUBLIC_SUPABASE_URL!,
-    process.env.SUPABASE_SERVICE_ROLE_KEY!
-  );
-
   const { data: profile } = await supabase
     .from("profiles")
-    .select("has_onboarded")
+    .select("has_completed_walkthrough")
     .eq("user_id", userId)
     .maybeSingle();
 
-  if (!profile?.has_onboarded) {
-    redirect("/onboarding");
-  }
-
-  const { data: goals } = await supabase
-    .from("goals")
-    .select("id, title, goal_type, sort_order")
-    .eq("user_id", userId)
-    .order("sort_order", { ascending: true });
-
   return (
-    <div className="max-w-3xl mx-auto p-6 space-y-6">
-      <h1 className="text-3xl font-bold">Weekly Goals</h1>
-      <GoalsDndClient initialGoals={goals || []} />
-      
-      <DashboardClient />
-    </div>
+    <DashboardClient
+      hasCompletedWalkthrough={Boolean(profile?.has_completed_walkthrough)}
+    />
   );
 }
+
+// import { auth } from "@clerk/nextjs/server";
+// import { redirect } from "next/navigation";
+// import { supabase } from "@/lib/supabase";
+// import DashboardClient from "./page.client";
+
+// export default async function DashboardPage() {
+//   const { userId } = await auth();
+//   if (!userId) redirect("/sign-in");
+
+//   const { data: profile } = await supabase
+//     .from("profiles")
+//     .select("has_completed_walkthrough")
+//     .eq("user_id", userId)
+//     .maybeSingle();
+
+//   return (
+//     <DashboardClient
+//       hasCompletedWalkthrough={Boolean(profile?.has_completed_walkthrough)}
+//     />
+//   );
+// }
+
+//   await fetch("/api/settings/weekly-email", {
+//   method: "POST",
+//   headers: { "Content-Type": "application/json" },
+//   body: JSON.stringify({ enabled: v }),
+// });
+
+
+//   await fetch("/api/email/send-weekly-insight", {
+//   method: "POST",
+//   headers: { "Content-Type": "application/json" },
+//   body: JSON.stringify({ weekStart }),
+// });
+
+
+  // return (
+  //   <div className="max-w-3xl mx-auto p-6 space-y-6">
+  //     <h1 className="text-3xl font-bold">Weekly Goals</h1>
+  //     <GoalsDndClient initialGoals={goals || []} />
+      
+  //     <DashboardClient />
+  //   </div>
+  // );
+
 
 // import { auth } from "@clerk/nextjs/server";
 // import { redirect } from "next/navigation";

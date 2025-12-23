@@ -16,12 +16,14 @@
     "@supabase/supabase-js": "^2.86.2",
     "clsx": "^2.1.1",
     "dayjs": "^1.11.19",
+    "driver.js": "^1.4.0",
     "framer-motion": "^12.23.26",
     "lucide-react": "^0.561.0",
     "next": "^16.0.7",
     "next-themes": "^0.4.6",
     "react": "^19.2.1",
     "react-dom": "^19.2.1",
+    "resend": "^6.6.0",
     "tailwind-merge": "^3.4.0"
   },
   "devDependencies": {
